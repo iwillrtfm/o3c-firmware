@@ -1,0 +1,20 @@
+# o3c run examples/run.toml
+# Keys 0, 1, 2 are left to right. A key's LED blinks green when its command exits 0, red otherwise.
+
+[[key]]
+index = 0
+run = ["notify-send", "O3C", "left key"]
+
+[[key]]
+index = 1
+run = ["xdg-open", "https://github.com/PacAnimal/o3c-firmware"]
+
+[[key]]
+index = 2
+run = ["sh", "-c", "date >> /tmp/o3c-presses"]
+
+# The knob: one run per click.
+[knob]
+up = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+2%"]
+down = ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-2%"]
+press = ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "toggle"]

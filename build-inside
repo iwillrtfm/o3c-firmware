@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Runs inside the build container (see ./build). /src is the tree, /target the cargo
+# target cache, /out the results.
+set -euo pipefail
+export CARGO_HOME=/opt/cargo
+
+echo "== firmware"
+cd /src/firmware
+CARGO_TARGET_DIR=/target/fw cargo build --release -q
+sysroot="$(rustc --print sysroot)"
+objcopy="$(find "$sysroot" -name llvm-objcopy -type f | head -1)"
+elf=/target/fw/riscv32imac-unknown-none-elf/release
+"$objcopy" -O binary "$elf/o3c-boot" /out/boot.bin
+"$objcopy" -O binary "$elf/o3c-app" /out/app.bin
+cp "$elf/o3c-boot" /out/boot.elf
+cp "$elf/o3c-app" /out/app.elf
+
+# full.bin: bootloader, app and app header in one image for WCH's ROM bootloader.
+python3 -I - <<'PY'
+import struct, zlib
+boot = open('/out/boot.bin', 'rb').read()
+app = open('/out/app.bin', 'rb').read()
+BOOT, HEADER, END = 0x8000, 0x2FF00, 0x30000
+assert len(boot) <= BOOT, f'bootloader is {len(boot)} bytes'
+assert len(app) <= HEADER - BOOT, f'app is {len(app)} bytes'
+img = bytearray(b'\xff' * END)
+img[:len(boot)] = boot
+img[BOOT:BOOT + len(app)] = app
+img[HEADER:HEADER + 12] = struct.pack('<III', 0x4F334321, len(app), zlib.crc32(app))
+open('/out/full.bin', 'wb').write(img)
+print(f'boot {len(boot)} bytes, app {len(app)} bytes, crc {zlib.crc32(app):08x}')
+PY
+
+echo "== host tool"
+cd /src/host
+CARGO_TARGET_DIR=/target/host cargo +stable build --release -q
+cp /target/host/release/o3c /out/o3c
+cp /opt/tools/bin/wchisp /out/wchisp
+ls -l /out
+chown -R "${OWNER:-0:0}" /out /target /opt/cargo/registry /opt/cargo/git

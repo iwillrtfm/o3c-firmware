@@ -1,0 +1,4 @@
+# O3C with this firmware (app and bootloader, vendor HID) and WCH's ROM bootloader (wchisp):
+# access for the logged-in user. Copy to /etc/udev/rules.d/, then: udevadm control --reload
+KERNEL=="hidraw*", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="0001", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="4348", ATTRS{idProduct}=="55e0", TAG+="uaccess"

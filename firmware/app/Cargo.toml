@@ -1,0 +1,15 @@
+[package]
+name = "o3c-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "o3c-app"
+test = false
+bench = false
+
+[dependencies]
+o3c-proto.workspace = true
+usbhs.workspace = true
+hw.workspace = true
+embedded-graphics = "0.8.2"

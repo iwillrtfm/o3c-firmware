@@ -1,0 +1,6 @@
+[package]
+name = "o3c-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]

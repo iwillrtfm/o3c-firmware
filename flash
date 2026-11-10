@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Flashes the O3C with what ./build made. Run where the keypad is plugged in.
+#   ./flash        app.bin through our bootloader; the running app resets into it, no hands needed
+#   ./flash boot   app.bin, then the app replaces the bootloader with boot.bin and tests it
+#   ./flash isp    full.bin through WCH's ROM bootloader: only after a plug-in with the BOOT0
+#                  pads bridged (README, "First install")
+set -euo pipefail
+out="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/out"
+case "${1:-}" in
+	"") "$out/o3c" flash "$out/app.bin" ;;
+	boot) "$out/o3c" flash "$out/app.bin" && "$out/o3c" flash-boot "$out/boot.bin" ;;
+	isp) "$out/wchisp" info && "$out/wchisp" flash "$out/full.bin" ;;
+	*) echo "usage: flash [boot|isp]" >&2; exit 2 ;;
+esac

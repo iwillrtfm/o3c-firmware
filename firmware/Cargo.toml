@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["boot", "app", "usbhs", "hw"]
+
+[workspace.dependencies]
+o3c-proto = { path = "../proto" }
+usbhs = { path = "usbhs" }
+hw = { path = "hw" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = true
+strip = false
+panic = "abort"
+
+[profile.dev]
+opt-level = "s"
+panic = "abort"

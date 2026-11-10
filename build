@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Builds the bootloader, the app and the o3c host tool in a throwaway Docker container.
+#   ./build
+# Results in ./out: boot.bin, app.bin, full.bin (bootloader + app + header, for WCH's ROM
+# bootloader), o3c (host tool, Linux x86-64), wchisp. Caches in ./.cache.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+image=o3c-firmware-build
+mkdir -p "$here/out" "$here/.cache/registry" "$here/.cache/git" "$here/.cache/target"
+docker build -q -t "$image" "$here" >/dev/null
+docker run --rm \
+	-v "$here:/src" -v "$here/out:/out" -v "$here/.cache/target:/target" \
+	-v "$here/.cache/registry:/opt/cargo/registry" -v "$here/.cache/git:/opt/cargo/git" \
+	-e OWNER="$(id -u):$(id -g)" \
+	"$image" bash /src/build-inside
