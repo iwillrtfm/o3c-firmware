@@ -12,4 +12,3 @@ bench = false
 o3c-proto.workspace = true
 usbhs.workspace = true
 hw.workspace = true
-embedded-graphics = "0.8.2"

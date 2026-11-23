@@ -1,4 +1,4 @@
-//! Just enough CH32V307 for the O3C: startup, one trap entry, clocks, GPIO, SysTick, SPI1,
+//! Just enough CH32V307 for the O3C: startup, one trap entry, clocks, GPIO, SysTick,
 //! ADC1, flash. Register sequences follow WCH's EVT library (system_ch32v30x.c,
 //! ch32v30x_flash.c) and the reference manual. No interrupt controller tricks: one trap
 //! entry, registers saved in software, no nesting, no hardware register stack (HPE).
@@ -263,36 +263,6 @@ pub mod time {
     }
 }
 
-/// SPI1, master, transmit only, 8-bit, mode 0, PCLK2 (72 MHz) / 4 = 18 MHz.
-pub mod spi1 {
-    use super::*;
-    const CTLR1: u32 = 0x4001_3000;
-    const CTLR2: u32 = 0x4001_3004;
-    const STATR: u32 = 0x4001_3008;
-    const DATAR: u32 = 0x4001_300C;
-
-    /// PA5 SCK, PA7 MOSI.
-    pub fn init() {
-        rcc::enable_apb2(rcc::SPI1 | rcc::IOPA);
-        gpio::mode(gpio::A, 5, gpio::AF_PP);
-        gpio::mode(gpio::A, 7, gpio::AF_PP);
-        w32(CTLR2, 0);
-        // BIDIMODE+BIDIOE (transmit only), SSM, SSI, SPE, BR = /4 (001), MSTR
-        w32(CTLR1, (1 << 15) | (1 << 14) | (1 << 9) | (1 << 8) | (1 << 6) | (0b001 << 3) | (1 << 2));
-    }
-    #[inline(always)]
-    pub fn write(bytes: &[u8]) {
-        for &b in bytes {
-            while r32(STATR) & 2 == 0 {}
-            w32(DATAR, b as u32);
-        }
-    }
-    /// Wait until the last byte left the shift register.
-    pub fn flush() {
-        while r32(STATR) & 2 == 0 {}
-        while r32(STATR) & 0x80 != 0 {}
-    }
-}
 
 /// ADC1, single software-started conversions.
 pub mod adc1 {

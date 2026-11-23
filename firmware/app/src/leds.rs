@@ -75,7 +75,7 @@ pub fn start() {
     w32(TIM_CTLR1, 1); // CEN
 }
 
-/// Stop the multiplexing (the panic screen turns all LEDs on by hand).
+/// Stop the multiplexing (the panic handler turns all LEDs on by hand).
 pub fn stop() {
     w32(TIM_CTLR1, 0);
 }

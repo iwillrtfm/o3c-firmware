@@ -1,45 +1,85 @@
 //! O3C app firmware. Starts at 0x8000, after the bootloader.
 //!
-//! USB: one vendor HID interface for the `o3c` host tool (key and knob events, raw sensor
-//! stream, LEDs, screen, bootloader entry). The keypad does nothing on its own: a program
-//! on the host (for example `o3c run`) gives the keys and the knob their meaning.
+//! USB: composite HID device:
+//! - Interface 0: vendor HID for the `o3c` host tool (key/knob events, raw sensor stream,
+//!   LEDs, bootloader entry).
+//! - Interface 1: native USB HID keyboard (Report ID 1) + consumer media keys (Report ID 2),
+//!   modeled after RMK's report engine so the keypad works standalone with minimal latency.
 //!
 //! One polling loop. Only the LED matrix runs from an interrupt (TIM2).
 #![no_std]
 #![no_main]
 
-mod display;
 mod input;
 mod leds;
 mod panic;
 
 use hw::flash::{PageWriter, WriteError};
 use hw::gpio;
-use embedded_graphics::mono_font::ascii::FONT_6X10;
-use embedded_graphics::mono_font::MonoTextStyle;
-use embedded_graphics::pixelcolor::raw::RawU16;
-use embedded_graphics::pixelcolor::Rgb565;
-use embedded_graphics::prelude::*;
-use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-use embedded_graphics::text::{Baseline, Text};
 use o3c_proto::{self as proto, cmd, event, msg, status};
 use usbhs::{Descriptors, Interface, Usb};
 
-use display::Frame;
+use hid::HidEngine;
 use input::{Key, Knob, KEYS};
 
-const VERSION: u16 = 8;
-const TEXT_LINES: usize = 5;
-/// Seconds the diagnostics stay on screen after the host configures the keypad.
-const SCREEN_SECS: u64 = 5;
-const TEXT_COLS: usize = 26;
+const VERSION: u16 = 9;
 
+/// Vendor HID endpoints (Interface 0).
 const EP_IN: u8 = 2;
 const EP_OUT: u8 = 3;
+/// Native Keyboard + Consumer Control HID endpoint (Interface 1).
+const EP_KBD_IN: u8 = 1;
+
+/// Optional vendor opcode to mute/unmute native HID (`req[1]`: 0 = disable, 1 = enable).
+const CMD_HID_ENABLE: u8 = 0x70;
 
 const VENDOR_REPORT: &[u8] = &[
     0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x09, 0x02,
     0x81, 0x02, 0x95, 0x40, 0x09, 0x03, 0x91, 0x02, 0xC0,
+];
+
+/// Composite HID report descriptor (RMK-style Report ID multiplexing):
+/// - Report ID 1: Standard 6KRO Keyboard (1 + 8 = 9 bytes IN)
+/// - Report ID 2: Consumer Control / Media Keys (1 + 2 = 3 bytes IN)
+const KBD_REPORT: &[u8] = &[
+    // Report ID 1: Keyboard
+    0x05, 0x01, // Usage Page (Generic Desktop)
+    0x09, 0x06, // Usage (Keyboard)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x01, //   Report ID (1)
+    0x05, 0x07, //   Usage Page (Keyboard/Keypad)
+    0x19, 0xE0, //   Usage Minimum (Left Control)
+    0x29, 0xE7, //   Usage Maximum (Right GUI)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x25, 0x01, //   Logical Maximum (1)
+    0x75, 0x01, //   Report Size (1)
+    0x95, 0x08, //   Report Count (8)
+    0x81, 0x02, //   Input (Data, Variable, Absolute) - Modifiers
+    0x95, 0x01, //   Report Count (1)
+    0x75, 0x08, //   Report Size (8)
+    0x81, 0x01, //   Input (Constant) - Reserved
+    0x95, 0x06, //   Report Count (6)
+    0x75, 0x08, //   Report Size (8)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x26, 0xFF, 0x00, // Logical Maximum (255)
+    0x05, 0x07, //   Usage Page (Keyboard/Keypad)
+    0x19, 0x00, //   Usage Minimum (0)
+    0x29, 0xFF, //   Usage Maximum (255)
+    0x81, 0x00, //   Input (Data, Array, Absolute) - Keycodes
+    0xC0,       // End Collection
+    // Report ID 2: Consumer Control
+    0x05, 0x0C, // Usage Page (Consumer)
+    0x09, 0x01, // Usage (Consumer Control)
+    0xA1, 0x01, // Collection (Application)
+    0x85, 0x02, //   Report ID (2)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x26, 0xFF, 0x03, // Logical Maximum (0x03FF)
+    0x19, 0x00, //   Usage Minimum (0)
+    0x2A, 0xFF, 0x03, // Usage Maximum (0x03FF)
+    0x75, 0x10, //   Report Size (16)
+    0x95, 0x01, //   Report Count (1)
+    0x81, 0x00, //   Input (Data, Array, Absolute)
+    0xC0,       // End Collection
 ];
 
 const DEVICE: &[u8] = &[
@@ -48,57 +88,430 @@ const DEVICE: &[u8] = &[
     0x00, 0x02, 1, 2, 0, 1,
 ];
 
+// Total length = 9 (Config) + 32 (Interface 0: Vendor HID) + 25 (Interface 1: Keyboard HID) = 66 bytes
 const CONFIG: &[u8] = &[
-    9, 2, 41, 0, 1, 1, 0, 0x80, 50, //
+    9, 2, 66, 0, 2, 1, 0, 0x80, 50, // Configuration (2 interfaces, 66 bytes total)
+    // Interface 0: Vendor HID (hid_desc_offset = 18)
     9, 4, 0, 0, 2, 3, 0, 0, 0, //
     9, 0x21, 0x11, 0x01, 0, 1, 0x22, VENDOR_REPORT.len() as u8, 0, //
     7, 5, 0x80 | EP_IN, 3, 64, 0, 1, //
-    7, 5, EP_OUT, 3, 64, 0, 1,
+    7, 5, EP_OUT, 3, 64, 0, 1, //
+    // Interface 1: Keyboard + Consumer HID (hid_desc_offset = 50)
+    9, 4, 1, 0, 1, 3, 0, 0, 0, //
+    9, 0x21, 0x11, 0x01, 0, 1, 0x22, KBD_REPORT.len() as u8, 0, //
+    7, 5, 0x80 | EP_KBD_IN, 3, 16, 0, 1, // 1000 Hz FS / 8000 Hz HS (bInterval = 1)
 ];
 
 static DESC: Descriptors = Descriptors {
     device: DEVICE,
     config: CONFIG,
-    interfaces: &[Interface { report: VENDOR_REPORT, hid_desc_offset: 18 }],
+    interfaces: &[
+        Interface { report: VENDOR_REPORT, hid_desc_offset: 18 },
+        Interface { report: KBD_REPORT, hid_desc_offset: 50 },
+    ],
     strings: &[&[4, 3, 0x09, 0x04], usbhs::string_descriptor!("o3c"), usbhs::string_descriptor!("O3C")],
-    in_eps: &[EP_IN],
+    in_eps: &[EP_IN, EP_KBD_IN],
     out_eps: &[EP_OUT],
 };
 
-/// The screen's frame buffer. Also drawn into by the panic handler.
-pub(crate) static mut FRAME: Frame = Frame::new();
+/// Low-latency single-layer USB HID keyboard & consumer control engine.
+mod hid {
+    use super::{Usb, EP_KBD_IN, KEYS};
 
-pub(crate) fn frame() -> &'static mut Frame {
-    unsafe { &mut *(&raw mut FRAME) }
+    const REPORT_ID_KBD: u8 = 1;
+    const REPORT_ID_CONSUMER: u8 = 2;
+
+    /// Standard USB HID Keyboard/Keypad Usage IDs (Usage Page 0x07).
+    #[allow(dead_code)]
+    #[repr(u8)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum KeyCode {
+        No = 0x00,
+        A = 0x04,
+        B = 0x05,
+        C = 0x06,
+        D = 0x07,
+        E = 0x08,
+        F = 0x09,
+        G = 0x0A,
+        H = 0x0B,
+        I = 0x0C,
+        J = 0x0D,
+        K = 0x0E,
+        L = 0x0F,
+        M = 0x10,
+        N = 0x11,
+        O = 0x12,
+        P = 0x13,
+        Q = 0x14,
+        R = 0x15,
+        S = 0x16,
+        T = 0x17,
+        U = 0x18,
+        V = 0x19,
+        W = 0x1A,
+        X = 0x1B,
+        Y = 0x1C,
+        Z = 0x1D,
+        Kc1 = 0x1E,
+        Kc2 = 0x1F,
+        Kc3 = 0x20,
+        Kc4 = 0x21,
+        Kc5 = 0x22,
+        Kc6 = 0x23,
+        Kc7 = 0x24,
+        Kc8 = 0x25,
+        Kc9 = 0x26,
+        Kc0 = 0x27,
+        Enter = 0x28,
+        Escape = 0x29,
+        Backspace = 0x2A,
+        Tab = 0x2B,
+        Space = 0x2C,
+        F1 = 0x3A,
+        F2 = 0x3B,
+        F3 = 0x3C,
+        F4 = 0x3D,
+        F5 = 0x3E,
+        F6 = 0x3F,
+        F7 = 0x40,
+        F8 = 0x41,
+        F9 = 0x42,
+        F10 = 0x43,
+        F11 = 0x44,
+        F12 = 0x45,
+        Right = 0x4F,
+        Left = 0x50,
+        Down = 0x51,
+        Up = 0x52,
+        LCtrl = 0xE0,
+        LShift = 0xE1,
+        LAlt = 0xE2,
+        LGui = 0xE3,
+        RCtrl = 0xE4,
+        RShift = 0xE5,
+        RAlt = 0xE6,
+        RGui = 0xE7,
+    }
+
+    /// USB HID Modifier bitmask.
+    #[allow(dead_code)]
+    pub struct Modifier;
+    #[allow(dead_code)]
+    impl Modifier {
+        pub const NONE: u8 = 0;
+        pub const LCTRL: u8 = 1 << 0;
+        pub const LSHIFT: u8 = 1 << 1;
+        pub const LALT: u8 = 1 << 2;
+        pub const LGUI: u8 = 1 << 3;
+        pub const RCTRL: u8 = 1 << 4;
+        pub const RSHIFT: u8 = 1 << 5;
+        pub const RALT: u8 = 1 << 6;
+        pub const RGUI: u8 = 1 << 7;
+    }
+
+    /// USB HID Consumer Control Usage IDs (Usage Page 0x0C).
+    #[allow(dead_code)]
+    #[repr(u16)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum Consumer {
+        Mute = 0x00E2,
+        VolUp = 0x00E9,
+        VolDown = 0x00EA,
+        PlayPause = 0x00CD,
+        NextTrack = 0x00B5,
+        PrevTrack = 0x00B6,
+    }
+
+    /// Direct single-layer key/encoder action binding.
+    #[allow(dead_code)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum KeyAction {
+        No,
+        Key(KeyCode),
+        Chord(u8, KeyCode),
+        Consumer(Consumer),
+    }
+
+    pub struct Keymap {
+        pub keys: [KeyAction; KEYS],
+        pub knob_cw: KeyAction,
+        pub knob_ccw: KeyAction,
+        pub knob_sw: KeyAction,
+    }
+
+    /// Static keymap: [Z, X, Escape], Knob = VolDown / VolUp, Knob Push = Mute.
+    pub const KEYMAP: Keymap = Keymap {
+        keys: [
+            KeyAction::Key(KeyCode::Z),
+            KeyAction::Key(KeyCode::X),
+            KeyAction::Key(KeyCode::Escape),
+        ],
+        knob_cw: KeyAction::Consumer(Consumer::VolUp),
+        knob_ccw: KeyAction::Consumer(Consumer::VolDown),
+        knob_sw: KeyAction::Consumer(Consumer::Mute),
+    };
+
+    /// Small ring buffer for edge-triggered consumer media packets (press + release pulses).
+    struct ConsumerQueue {
+        buf: [[u8; 3]; 16],
+        head: usize,
+        len: usize,
+    }
+
+    impl ConsumerQueue {
+        const fn new() -> Self {
+            Self {
+                buf: [[REPORT_ID_CONSUMER, 0, 0]; 16],
+                head: 0,
+                len: 0,
+            }
+        }
+
+        #[inline]
+        fn push(&mut self, pkt: [u8; 3]) {
+            if self.len < self.buf.len() {
+                let idx = (self.head + self.len) % self.buf.len();
+                self.buf[idx] = pkt;
+                self.len += 1;
+            }
+        }
+
+        #[inline]
+        fn front(&self) -> Option<&[u8; 3]> {
+            (self.len > 0).then(|| &self.buf[self.head])
+        }
+
+        #[inline]
+        fn pop(&mut self) {
+            if self.len > 0 {
+                self.head = (self.head + 1) % self.buf.len();
+                self.len -= 1;
+            }
+        }
+
+        fn clear(&mut self) {
+            self.head = 0;
+            self.len = 0;
+        }
+    }
+
+    /// Tracks active keys and reference-counted modifiers, coalescing keyboard state
+    /// into a single latest-state report for zero-queue-delay transmission.
+    pub struct HidEngine {
+        pub enabled: bool,
+        mod_counts: [u8; 8],
+        pressed_keys: [u8; 6],
+        kbd_report: [u8; 9],
+        kbd_dirty: bool,
+        consumer_queue: ConsumerQueue,
+    }
+
+    impl HidEngine {
+        pub const fn new() -> Self {
+            Self {
+                enabled: true,
+                mod_counts: [0; 8],
+                pressed_keys: [0; 6],
+                kbd_report: [REPORT_ID_KBD, 0, 0, 0, 0, 0, 0, 0, 0],
+                kbd_dirty: false,
+                consumer_queue: ConsumerQueue::new(),
+            }
+        }
+
+        pub fn reset(&mut self) {
+            self.mod_counts = [0; 8];
+            self.pressed_keys = [0; 6];
+            self.kbd_report = [REPORT_ID_KBD, 0, 0, 0, 0, 0, 0, 0, 0];
+            self.kbd_dirty = false;
+            self.consumer_queue.clear();
+        }
+
+        /// Immediately flushes the latest keyboard state (highest priority) or next
+        /// consumer media report to `EP_KBD_IN`.
+        #[inline]
+        pub fn flush(&mut self, usb: &mut Usb) {
+            if !usb.configured() {
+                return;
+            }
+            if self.kbd_dirty {
+                if usb.write(EP_KBD_IN, &self.kbd_report) {
+                    self.kbd_dirty = false;
+                }
+                return;
+            }
+            if let Some(pkt) = self.consumer_queue.front() {
+                let pkt = *pkt;
+                if usb.write(EP_KBD_IN, &pkt) {
+                    self.consumer_queue.pop();
+                }
+            }
+        }
+
+        #[inline]
+        pub fn on_key(&mut self, index: usize, down: bool) {
+            if !self.enabled || index >= KEYS {
+                return;
+            }
+            let action = KEYMAP.keys[index];
+            if down {
+                self.press_action(action);
+            } else {
+                self.release_action(action);
+            }
+        }
+
+        #[inline]
+        pub fn on_knob_detent(&mut self, detent: i8) {
+            if !self.enabled || detent == 0 {
+                return;
+            }
+            let action = if detent > 0 { KEYMAP.knob_cw } else { KEYMAP.knob_ccw };
+            let steps = detent.unsigned_abs().min(8);
+            for _ in 0..steps {
+                self.press_action(action);
+                self.release_action(action);
+            }
+        }
+
+        #[inline]
+        pub fn on_knob_switch(&mut self, down: bool) {
+            if !self.enabled {
+                return;
+            }
+            if down {
+                self.press_action(KEYMAP.knob_sw);
+            } else {
+                self.release_action(KEYMAP.knob_sw);
+            }
+        }
+
+        #[inline]
+        fn press_action(&mut self, action: KeyAction) {
+            match action {
+                KeyAction::No => {}
+                KeyAction::Key(kc) => {
+                    self.register_usage(kc as u8);
+                    self.sync_kbd_report();
+                }
+                KeyAction::Chord(mods, kc) => {
+                    self.register_mod_mask(mods);
+                    self.register_usage(kc as u8);
+                    self.sync_kbd_report();
+                }
+                KeyAction::Consumer(usage) => {
+                    let bytes = (usage as u16).to_le_bytes();
+                    self.consumer_queue.push([REPORT_ID_CONSUMER, bytes[0], bytes[1]]);
+                }
+            }
+        }
+
+        #[inline]
+        fn release_action(&mut self, action: KeyAction) {
+            match action {
+                KeyAction::No => {}
+                KeyAction::Key(kc) => {
+                    self.unregister_usage(kc as u8);
+                    self.sync_kbd_report();
+                }
+                KeyAction::Chord(mods, kc) => {
+                    self.unregister_usage(kc as u8);
+                    self.unregister_mod_mask(mods);
+                    self.sync_kbd_report();
+                }
+                KeyAction::Consumer(_) => {
+                    self.consumer_queue.push([REPORT_ID_CONSUMER, 0, 0]);
+                }
+            }
+        }
+
+        #[inline]
+        fn register_mod_mask(&mut self, mask: u8) {
+            for bit in 0..8 {
+                if mask & (1 << bit) != 0 {
+                    self.mod_counts[bit] = self.mod_counts[bit].saturating_add(1);
+                }
+            }
+        }
+
+        #[inline]
+        fn unregister_mod_mask(&mut self, mask: u8) {
+            for bit in 0..8 {
+                if mask & (1 << bit) != 0 {
+                    self.mod_counts[bit] = self.mod_counts[bit].saturating_sub(1);
+                }
+            }
+        }
+
+        #[inline]
+        fn register_usage(&mut self, code: u8) {
+            if code == 0 {
+                return;
+            }
+            if (0xE0..=0xE7).contains(&code) {
+                let idx = (code - 0xE0) as usize;
+                self.mod_counts[idx] = self.mod_counts[idx].saturating_add(1);
+                return;
+            }
+            if self.pressed_keys.contains(&code) {
+                return;
+            }
+            if let Some(slot) = self.pressed_keys.iter_mut().find(|k| **k == 0) {
+                *slot = code;
+            }
+        }
+
+        #[inline]
+        fn unregister_usage(&mut self, code: u8) {
+            if code == 0 {
+                return;
+            }
+            if (0xE0..=0xE7).contains(&code) {
+                let idx = (code - 0xE0) as usize;
+                self.mod_counts[idx] = self.mod_counts[idx].saturating_sub(1);
+                return;
+            }
+            for slot in self.pressed_keys.iter_mut() {
+                if *slot == code {
+                    *slot = 0;
+                }
+            }
+        }
+
+        #[inline]
+        fn sync_kbd_report(&mut self) {
+            let mut mods = 0u8;
+            for bit in 0..8 {
+                if self.mod_counts[bit] > 0 {
+                    mods |= 1 << bit;
+                }
+            }
+            let mut report = [REPORT_ID_KBD, mods, 0, 0, 0, 0, 0, 0, 0];
+            report[3..9].copy_from_slice(&self.pressed_keys);
+            if report != self.kbd_report {
+                self.kbd_report = report;
+                self.kbd_dirty = true;
+            }
+        }
+    }
 }
 
 struct State {
     keys: [Key; KEYS],
+    /// Fixed-point Q14.2 EWMA accumulators (`filtered = adc_ewma >> 2`) for Hall sensors.
+    adc_ewma: [u32; KEYS],
     pins: u8,
-    knob: i32,
-    knob_sw: bool,
     stream: bool,
-    screen_mode: u8,
-    text: [[u8; TEXT_COLS]; TEXT_LINES],
-    text_len: [u8; TEXT_LINES],
-    text_color: [u16; TEXT_LINES],
     led_override: Option<[[u8; 3]; 3]>,
     brightness: u8,
-    /// Screen on (picture) or off (panel asleep), as the host set it with BRIGHTNESS.
-    screen_on: bool,
-    /// Screen follows USB: on while there is no host and for SCREEN_SECS after it
-    /// configures, then off. BRIGHTNESS ends this.
-    screen_auto: bool,
-    /// Screen black and the panel asleep.
-    blanked: bool,
     /// End of the start-up LED flash (ms).
     hello_until: u64,
     hello_done: bool,
     /// Per LED: (r, g, b), start ms, on/off period ms, blinks.
     blink: [Option<([u8; 3], u64, u16, u8)>; 3],
-    dirty: bool,
     reset_at: Option<u64>,
     boot: PageWriter,
+    hid: HidEngine,
 }
 
 /// Small ring of reports for the vendor IN endpoint.
@@ -109,6 +522,7 @@ struct Queue {
 }
 
 impl Queue {
+    #[inline]
     fn push(&mut self, r: [u8; 64]) {
         if self.len < self.buf.len() {
             let i = (self.head + self.len) % self.buf.len();
@@ -116,9 +530,11 @@ impl Queue {
             self.len += 1;
         }
     }
+    #[inline]
     fn front(&self) -> Option<&[u8; 64]> {
         (self.len > 0).then(|| &self.buf[self.head])
     }
+    #[inline]
     fn pop(&mut self) {
         if self.len > 0 {
             self.head = (self.head + 1) % self.buf.len();
@@ -127,6 +543,7 @@ impl Queue {
     }
 }
 
+#[inline]
 fn event_report(kind: u8, index: u8, value: i16) -> [u8; 64] {
     let mut r = [0u8; 64];
     r[0] = msg::EVENT;
@@ -136,12 +553,13 @@ fn event_report(kind: u8, index: u8, value: i16) -> [u8; 64] {
     r
 }
 
+#[inline]
 fn now_ms() -> u64 {
     hw::time::ms()
 }
 
 /// Built-in LED pattern, (r, g, b) per LED: off, except a short blue-white flash when the
-/// host first configures the keypad (it started and is connected). The host can set its own.
+/// host first configures the keypad.
 fn led_pattern(s: &State, now: u64) -> [[u8; 3]; 3] {
     if let Some(l) = s.led_override {
         return l;
@@ -161,103 +579,6 @@ fn led_pattern(s: &State, now: u64) -> [[u8; 3]; 3] {
         }
     }
     out
-}
-
-struct Line {
-    b: [u8; 32],
-    n: usize,
-}
-
-impl Line {
-    fn new() -> Self {
-        Self { b: [0; 32], n: 0 }
-    }
-    fn as_str(&self) -> &str {
-        core::str::from_utf8(&self.b[..self.n]).unwrap_or("")
-    }
-}
-
-impl core::fmt::Write for Line {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for &c in s.as_bytes() {
-            if self.n < self.b.len() {
-                self.b[self.n] = c;
-                self.n += 1;
-            }
-        }
-        Ok(())
-    }
-}
-
-/// What the diagnostics screen shows about USB.
-#[derive(Default)]
-struct UsbStatus {
-    configured: bool,
-    resets: u32,
-    setups: u32,
-}
-
-impl From<&Usb> for UsbStatus {
-    fn from(u: &Usb) -> Self {
-        Self { configured: u.configured(), resets: u.resets, setups: u.setups }
-    }
-}
-
-fn draw_builtin(f: &mut Frame, s: &State, usb: UsbStatus) {
-    use core::fmt::Write;
-    let _ = f.clear(Rgb565::BLACK);
-    for line in 0..TEXT_LINES {
-        let len = s.text_len[line] as usize;
-        if len == 0 {
-            continue;
-        }
-        let text = core::str::from_utf8(&s.text[line][..len]).unwrap_or("?");
-        let color = Rgb565::from(RawU16::new(s.text_color[line]));
-        let _ = Text::with_baseline(text, Point::new(1, line as i32 * 10), MonoTextStyle::new(&FONT_6X10, color), Baseline::Top).draw(f);
-    }
-    let dim = MonoTextStyle::new(&FONT_6X10, Rgb565::new(20, 40, 20));
-    let mut l = Line::new();
-    let _ = write!(l, "knob {}{} io {:03b}", s.knob, if s.knob_sw { " push" } else { "" }, s.pins);
-    let _ = Text::with_baseline(l.as_str(), Point::new(1, 41), dim, Baseline::Top).draw(f);
-    let mut l = Line::new();
-    let _ = write!(
-        l,
-        "usb {} r{} s{} t{}",
-        if usb.configured { "ok" } else { "--" },
-        usb.resets,
-        usb.setups,
-        now_ms() / 1000
-    );
-    let _ = Text::with_baseline(l.as_str(), Point::new(1, 51), dim, Baseline::Top).draw(f);
-    for k in 0..KEYS {
-        let key = &s.keys[k];
-        let x = k as i32 * 54;
-        let _ = Rectangle::new(Point::new(x, 62), Size::new(52, 18))
-            .into_styled(PrimitiveStyle::with_stroke(Rgb565::new(8, 16, 8), 1))
-            .draw(f);
-        let full = key.travel.max(key.press).max(1) as u32;
-        let w = (key.delta() as u32 * 50 / full).min(50);
-        let color = if key.down { Rgb565::new(31, 40, 0) } else { Rgb565::new(0, 30, 20) };
-        if w > 0 {
-            let _ = Rectangle::new(Point::new(x + 1, 63), Size::new(w, 16)).into_styled(PrimitiveStyle::with_fill(color)).draw(f);
-        }
-    }
-}
-
-fn set_line(s: &mut State, line: usize, color: u16, text: &[u8]) {
-    if line >= TEXT_LINES {
-        return;
-    }
-    let n = text.len().min(TEXT_COLS);
-    s.text[line][..n].copy_from_slice(&text[..n]);
-    for c in s.text[line][..n].iter_mut() {
-        if !(0x20..0x7F).contains(c) {
-            *c = b'?';
-        }
-    }
-    s.text_len[line] = n as u8;
-    s.text_color[line] = color;
-    s.dirty = true;
 }
 
 fn handle(s: &mut State, q: &mut Queue, req: &[u8; 64]) {
@@ -300,29 +621,9 @@ fn handle(s: &mut State, q: &mut Queue, req: &[u8; 64]) {
                 ack(q, status::BAD_ARG);
             }
         }
-        cmd::TEXT => {
-            let len = (req[4] as usize).min(59);
-            set_line(s, req[1] as usize, proto::get_u16(req, 2), &req[5..5 + len]);
-            ack(q, status::OK);
-        }
+        cmd::TEXT | cmd::PIXELS | cmd::SCREEN_MODE => ack(q, status::OK),
         cmd::STREAM => {
             s.stream = req[1] != 0;
-            ack(q, status::OK);
-        }
-        cmd::PIXELS => {
-            let first = proto::get_u16(req, 1) as usize;
-            let n = (req[3] as usize).min(30);
-            let f = frame();
-            for i in 0..n {
-                f.set_raw(first + i, proto::get_u16(req, 4 + i * 2));
-            }
-            if s.screen_mode == 1 {
-                s.dirty = true;
-            }
-        }
-        cmd::SCREEN_MODE => {
-            s.screen_mode = req[1];
-            s.dirty = true;
             ack(q, status::OK);
         }
         cmd::THRESHOLDS => {
@@ -343,9 +644,6 @@ fn handle(s: &mut State, q: &mut Queue, req: &[u8; 64]) {
         }
         cmd::BRIGHTNESS => {
             s.brightness = req[1];
-            s.screen_on = req[2] != 0;
-            s.screen_auto = false;
-            s.dirty = true;
             ack(q, status::OK);
         }
         cmd::BOOTLOADER | cmd::RESET => {
@@ -384,6 +682,13 @@ fn handle(s: &mut State, q: &mut Queue, req: &[u8; 64]) {
             let st = boot_commit(&mut s.boot, proto::get_u32(req, 1), proto::get_u32(req, 5));
             s.led_override = None;
             ack(q, st)
+        }
+        CMD_HID_ENABLE => {
+            s.hid.enabled = req[1] != 0;
+            if !s.hid.enabled {
+                s.hid.reset();
+            }
+            ack(q, status::OK);
         }
         _ => ack(q, status::UNKNOWN),
     }
@@ -427,14 +732,17 @@ fn leds_red(s: &mut State) {
     leds::set(&[[255, 0, 0]; 3]);
 }
 
-fn read_keys() -> [u16; KEYS] {
-    let mut acc = [0u32; KEYS];
-    for _ in 0..4 {
-        for (k, chan) in [13u32, 12, 11].iter().enumerate() {
-            acc[k] += hw::adc1::read(*chan).unwrap_or(0) as u32;
-        }
+/// Single-sample ADC read per channel smoothed with a fixed-point Q14.2 EWMA (alpha = 1/4).
+#[inline(always)]
+fn read_keys_ewma(ewma: &mut [u32; KEYS]) -> [u16; KEYS] {
+    const CHANS: [u32; KEYS] = [13, 12, 11];
+    let mut out = [0u16; KEYS];
+    for k in 0..KEYS {
+        let sample = hw::adc1::read(CHANS[k]).unwrap_or(0) as u32;
+        ewma[k] = ewma[k] - (ewma[k] >> 2) + sample;
+        out[k] = (ewma[k] >> 2) as u16;
     }
-    [(acc[0] / 4) as u16, (acc[1] / 4) as u16, (acc[2] / 4) as u16]
+    out
 }
 
 #[no_mangle]
@@ -467,69 +775,83 @@ extern "C" fn rust_main() -> ! {
     }
     hw::adc1::init();
     for chan in [11, 12, 13] {
-        hw::adc1::sample_time(chan, 6); // 71.5 cycles
+        hw::adc1::sample_time(chan, 3); // 28.5 cycles (~2.5x faster than 71.5 cycles)
     }
-
-    display::init();
 
     let mut s = State {
         keys: [Key::new(); KEYS],
+        adc_ewma: [0; KEYS],
         pins: 0,
-        knob: 0,
-        knob_sw: false,
         stream: false,
-        screen_mode: 0,
-        text: [[b' '; TEXT_COLS]; TEXT_LINES],
-        text_len: [0; TEXT_LINES],
-        text_color: [0xFFFF; TEXT_LINES],
         led_override: None,
         brightness: 255,
-        screen_on: true,
-        screen_auto: true,
-        blanked: false,
         hello_until: 0,
         hello_done: false,
         blink: [None; 3],
-        dirty: true,
         reset_at: None,
         boot: PageWriter::new(),
+        hid: HidEngine::new(),
     };
-    set_line(&mut s, 0, 0xFFE0, b"O3C firmware 8");
-    set_line(&mut s, 1, 0x07FF, b"no host yet");
 
-    // Rest values: average of 64 samples.
+    // Rest values & EWMA seed: average of 64 samples.
     let mut sum = [0u32; KEYS];
     for _ in 0..64 {
-        let r = read_keys();
-        for k in 0..KEYS {
-            sum[k] += r[k] as u32;
+        for (k, chan) in [13u32, 12, 11].iter().enumerate() {
+            sum[k] += hw::adc1::read(*chan).unwrap_or(0) as u32;
         }
     }
     for k in 0..KEYS {
-        s.keys[k].rest = (sum[k] / 64) << 4;
+        let avg = sum[k] / 64;
+        s.keys[k].rest = avg << 4;
+        s.adc_ewma[k] = avg << 2;
     }
-
-    draw_builtin(frame(), &s, UsbStatus::default());
-    display::flush(frame());
 
     let mut usb = Usb::new(&DESC);
     let mut q = Queue { buf: [[0; 64]; 16], head: 0, len: 0 };
     let mut knob = Knob::new();
     let mut last_ms = now_ms();
-    let mut last_draw = 0u64;
     let mut last_sw = false;
-    let mut flush_pos: Option<usize> = None;
     let mut was_configured = false;
-    let mut configured_at = 0u64;
     let mut req = [0u8; 64];
 
     loop {
         usb.poll();
 
+        if usb.configured() != was_configured {
+            was_configured = usb.configured();
+            if !was_configured {
+                s.hid.reset();
+            } else if !s.hello_done {
+                s.hello_done = true;
+                s.hello_until = now_ms() + 250;
+            }
+        }
+
+        // Fast path 1: scan Hall-effect keys every iteration and push HID state immediately.
+        let raw = read_keys_ewma(&mut s.adc_ewma);
+        for k in 0..KEYS {
+            if let Some(down) = s.keys[k].update(raw[k]) {
+                s.hid.on_key(k, down);
+                q.push(event_report(event::KEY, k as u8, down as i16));
+            }
+        }
+
+        // Fast path 2: sample rotary encoder quadrature every iteration.
+        let pins = ((gpio::read(gpio::B) >> 12) & 7) as u8;
+        s.pins = pins;
+        let detent = knob.update(pins & (1 << input::KNOB_A) != 0, pins & (1 << input::KNOB_B) != 0);
+        if detent != 0 {
+            s.hid.on_knob_detent(detent);
+            q.push(event_report(event::KNOB, 0, detent as i16));
+        }
+
+        // Flush native HID endpoint before vendor endpoint traffic.
+        s.hid.flush(&mut usb);
+
+        // Vendor HID traffic (Interface 0).
         if usb.read(EP_OUT, &mut req).is_some() {
             handle(&mut s, &mut q, &req);
         }
-
         if let Some(r) = q.front() {
             let r = *r;
             if usb.write(EP_IN, &r) {
@@ -537,43 +859,15 @@ extern "C" fn rust_main() -> ! {
             }
         }
 
-        if usb.configured() != was_configured {
-            was_configured = usb.configured();
-            configured_at = now_ms();
-            s.dirty = true;
-            if was_configured && !s.hello_done {
-                s.hello_done = true;
-                s.hello_until = configured_at + 250;
-            }
-        }
-
+        // 1 ms housekeeping: knob push switch, LEDs, raw stream, and reset checks.
         let now = now_ms();
         if now != last_ms {
             last_ms = now;
-            let raw = read_keys();
-            let pins = ((gpio::read(gpio::B) >> 12) & 7) as u8;
-            if pins != s.pins {
-                s.pins = pins;
-                s.dirty = true;
-            }
-            let detent = knob.update(pins & (1 << input::KNOB_A) != 0, pins & (1 << input::KNOB_B) != 0);
             let sw = pins & (1 << input::KNOB_SW) == 0;
-            for k in 0..KEYS {
-                if let Some(down) = s.keys[k].update(raw[k]) {
-                    q.push(event_report(event::KEY, k as u8, down as i16));
-                    s.dirty = true;
-                }
-            }
-            if detent != 0 {
-                s.knob += detent as i32;
-                q.push(event_report(event::KNOB, 0, detent as i16));
-                s.dirty = true;
-            }
             if sw != last_sw {
                 last_sw = sw;
-                s.knob_sw = sw;
+                s.hid.on_knob_switch(sw);
                 q.push(event_report(event::KNOB_BUTTON, 0, sw as i16));
-                s.dirty = true;
             }
             if now % 5 == 0 {
                 leds::set(&led_pattern(&s, now));
@@ -598,43 +892,6 @@ extern "C" fn rust_main() -> ! {
                     usb.disconnect();
                     hw::time::delay_ms(50);
                     hw::system_reset();
-                }
-            }
-        }
-
-        // Screen: redraw at most every 33 ms (and once a second for the clock), sent in
-        // 1 KiB pieces between USB polls.
-        match flush_pos {
-            Some(pos) => {
-                let next = display::step(frame(), pos, 1024);
-                flush_pos = if next >= display::BYTES { None } else { Some(next) };
-            }
-            None => {
-                let on = if s.screen_auto {
-                    !usb.configured() || now - configured_at < SCREEN_SECS * 1000
-                } else {
-                    s.screen_on
-                };
-                if !on {
-                    if !s.blanked {
-                        // Black picture, then the panel off and asleep.
-                        s.blanked = true;
-                        let _ = frame().clear(Rgb565::BLACK);
-                        display::flush(frame());
-                        display::panel(false);
-                    }
-                } else if s.blanked || (s.dirty && now - last_draw >= 33) || now - last_draw >= 1000 {
-                    if s.blanked {
-                        display::panel(true);
-                    }
-                    s.blanked = false;
-                    last_draw = now;
-                    s.dirty = false;
-                    if s.screen_mode == 0 {
-                        draw_builtin(frame(), &s, UsbStatus::from(&usb));
-                    }
-                    display::begin();
-                    flush_pos = Some(0);
                 }
             }
         }
