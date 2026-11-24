@@ -240,12 +240,12 @@ mod hid {
         pub knob_sw: KeyAction,
     }
 
-    /// Static keymap: [Z, X, Escape], Knob = VolDown / VolUp, Knob Push = Mute.
+    /// Static keymap: [Z, X, C], Knob = VolDown / VolUp, Knob Push = Mute.
     pub const KEYMAP: Keymap = Keymap {
         keys: [
             KeyAction::Key(KeyCode::Z),
             KeyAction::Key(KeyCode::X),
-            KeyAction::Key(KeyCode::Escape),
+            KeyAction::Key(KeyCode::C),
         ],
         knob_cw: KeyAction::Consumer(Consumer::VolUp),
         knob_ccw: KeyAction::Consumer(Consumer::VolDown),
@@ -777,6 +777,14 @@ extern "C" fn rust_main() -> ! {
     for chan in [11, 12, 13] {
         hw::adc1::sample_time(chan, 3); // 28.5 cycles (~2.5x faster than 71.5 cycles)
     }
+    hw::time::delay_ms(10);
+
+    // Discard initial dummy reads so the ADC sample-and-hold capacitor stabilizes.
+    for _ in 0..8 {
+        for chan in [13u32, 12, 11] {
+            let _ = hw::adc1::read(chan);
+        }
+    }
 
     let mut s = State {
         keys: [Key::new(); KEYS],
@@ -827,7 +835,7 @@ extern "C" fn rust_main() -> ! {
             }
         }
 
-        // Fast path 1: scan Hall-effect keys every iteration and push HID state immediately.
+        // Fast path 1: scan Hall-effect keys every iteration.
         let raw = read_keys_ewma(&mut s.adc_ewma);
         for k in 0..KEYS {
             if let Some(down) = s.keys[k].update(raw[k]) {
@@ -863,6 +871,9 @@ extern "C" fn rust_main() -> ! {
         let now = now_ms();
         if now != last_ms {
             last_ms = now;
+            for k in 0..KEYS {
+                s.keys[k].drift();
+            }
             let sw = pins & (1 << input::KNOB_SW) == 0;
             if sw != last_sw {
                 last_sw = sw;

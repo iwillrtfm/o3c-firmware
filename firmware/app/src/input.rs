@@ -1,5 +1,5 @@
 //! Hall keys (ADC1: PC3 = IN13 left, PC2 = IN12 middle, PC1 = IN11 right; rest about 2100,
-//! a full press about +800) and the knob on PB12 (A), PB13 (B), PB14 (switch), pull-up.
+//! a full press about +/-800) and the knob on PB12 (A), PB13 (B), PB14 (switch), pull-up.
 
 pub const KEYS: usize = 3;
 
@@ -28,15 +28,19 @@ impl Key {
         Self { rest: 0, raw: 0, travel: 0, press: DEFAULT_PRESS, release: DEFAULT_RELEASE, down: false }
     }
 
+    #[inline(always)]
     pub fn rest(&self) -> u16 {
         (self.rest >> 4) as u16
     }
 
+    /// Unsigned travel distance from resting baseline (supports both magnet polarities).
+    #[inline(always)]
     pub fn delta(&self) -> u16 {
-        (self.raw as i32 - self.rest() as i32).unsigned_abs() as u16
+        self.raw.abs_diff(self.rest())
     }
 
     /// Returns Some(new state) on a change.
+    #[inline(always)]
     pub fn update(&mut self, raw: u16) -> Option<bool> {
         self.raw = raw;
         let d = self.delta();
@@ -51,12 +55,17 @@ impl Key {
             self.down = false;
             return Some(false);
         }
+        None
+    }
+
+    /// Follow slow thermal drift of the rest value (~1/256 per ms). Call at 1 kHz when released.
+    #[inline(always)]
+    pub fn drift(&mut self) {
+        let d = self.delta();
         if !self.down && d < self.release / 2 {
-            // Follow slow drift of the rest value: 1/256 per sample.
-            let target = (raw as u32) << 4;
+            let target = (self.raw as u32) << 4;
             self.rest = self.rest - (self.rest >> 8) + (target >> 8);
         }
-        None
     }
 }
 
@@ -71,6 +80,7 @@ impl Knob {
         Self { last: 0xFF, acc: 0 }
     }
 
+    #[inline(always)]
     pub fn update(&mut self, a: bool, b: bool) -> i8 {
         let s = ((a as u8) << 1) | b as u8;
         if self.last == 0xFF {
